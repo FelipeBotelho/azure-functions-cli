@@ -2,16 +2,16 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
-using Colors.Net;
 using Azure.Functions.Cli.Interfaces;
-using static Azure.Functions.Cli.Common.OutputTheme;
+using Colors.Net;
 using Fclp;
+using static Azure.Functions.Cli.Common.OutputTheme;
 
 namespace Azure.Functions.Cli.Actions.LocalActions
 {
-    [Action(Name = "create", Context = Context.Function, HelpText = "Create a new function from a template.")]
     [Action(Name = "new", Context = Context.Function, HelpText = "Create a new function from a template.")]
-    [Action(Name = "new")]
+    [Action(Name = "new", HelpText = "Create a new function from a template.")]
+    [Action(Name = "create", Context = Context.Function, HelpText = "Create a new function from a template.")]
     internal class CreateFunctionAction : BaseAction
     {
         private readonly ITemplatesManager _templatesManager;
@@ -44,6 +44,20 @@ namespace Azure.Functions.Cli.Actions.LocalActions
 
         public async override Task RunAsync()
         {
+            if (Console.IsOutputRedirected || Console.IsInputRedirected)
+            {
+                if (string.IsNullOrEmpty(Language) ||
+                    string.IsNullOrEmpty(TemplateName) ||
+                    string.IsNullOrEmpty(FunctionName))
+                {
+                    ColoredConsole
+                        .Error
+                        .WriteLine(ErrorColor("Running with stdin\\stdout redirected. Command must specify --language, --template, and --name explicitly."))
+                        .WriteLine(ErrorColor("See 'func help function' for more details"));
+                    return;
+                }
+            }
+
             var templates = await _templatesManager.Templates;
 
             ColoredConsole.Write("Select a language: ");

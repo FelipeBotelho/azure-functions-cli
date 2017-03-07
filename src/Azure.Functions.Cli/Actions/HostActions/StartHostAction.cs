@@ -43,6 +43,8 @@ namespace Azure.Functions.Cli.Actions.HostActions
 
         public bool UseHttps { get; set; }
 
+        public bool IgnoreHostJsonNotFound { get; set; }
+
         public override ICommandLineParserResult ParseArgs(string[] args)
         {
             Parser
@@ -81,14 +83,27 @@ namespace Azure.Functions.Cli.Actions.HostActions
                 .SetDefault(false)
                 .Callback(s => UseHttps = s);
 
+            Parser
+                .Setup<bool>("ignoreHostJsonNotFound")
+                .WithDescription($"Default is false. Ignores the check for {ScriptConstants.HostMetadataFileName} in current directory then up until it finds one.")
+                .SetDefault(false)
+                .Callback(f => IgnoreHostJsonNotFound = f);
+
             return Parser.Parse(args);
         }
 
         public override async Task RunAsync()
         {
             Utilities.PrintLogo();
+
+            var scriptPath = IgnoreHostJsonNotFound
+                ? Environment.CurrentDirectory
+                : ScriptHostHelpers.GetFunctionAppRootDirectory(Environment.CurrentDirectory);
+            var settings = SelfHostWebHostSettingsFactory.Create(ConsoleTraceLevel, scriptPath);
+
             ReadSecrets();
             CheckHostJsonId();
+
             var baseAddress = Setup();
 
             var config = new HttpSelfHostConfiguration(baseAddress)
@@ -102,11 +117,10 @@ namespace Azure.Functions.Cli.Actions.HostActions
             config.Formatters.Clear();
             config.Formatters.Add(new JsonMediaTypeFormatter());
 
-            var settings = SelfHostWebHostSettingsFactory.Create(ConsoleTraceLevel);
-
             Environment.SetEnvironmentVariable("EDGE_NODE_PARAMS", $"--debug={NodeDebugPort}", EnvironmentVariableTarget.Process);
 
             WebApiConfig.Initialize(config, settings: settings);
+
             using (var httpServer = new HttpSelfHostServer(config))
             {
                 await httpServer.OpenAsync();
@@ -125,6 +139,10 @@ namespace Azure.Functions.Cli.Actions.HostActions
                 var hostConfig = JsonConvert.DeserializeObject<JObject>(FileSystemHelpers.ReadAllTextFromFile(ScriptConstants.HostMetadataFileName));
                 if (hostConfig["id"] == null)
                 {
+                    ColoredConsole.Out
+                        .WriteLine(WarningColor($"No \"id\" property defined in {ScriptConstants.HostMetadataFileName}."))
+                        .WriteLine(WarningColor($"Updating {ScriptConstants.HostMetadataFileName} with a new \"id\""));
+
                     hostConfig.Add("id", Guid.NewGuid().ToString("N"));
                     FileSystemHelpers.WriteAllTextToFile(ScriptConstants.HostMetadataFileName, JsonConvert.SerializeObject(hostConfig, Formatting.Indented));
                 }
@@ -148,9 +166,9 @@ namespace Azure.Functions.Cli.Actions.HostActions
 
             if (hostManager != null)
             {
-                foreach (var function in hostManager.Instance.Functions)
+                foreach (var function in hostManager.Instance.Functions.Where(f => f.Metadata.IsHttpFunction()))
                 {
-                    var httpRoute = function.Metadata.Bindings.FirstOrDefault(b => b.Type == "httpTrigger")?.Raw["route"]?.ToString();
+                    var httpRoute = function.Metadata.Bindings.FirstOrDefault(b => b.Type == "httpTrigger").Raw["route"]?.ToString();
                     httpRoute = httpRoute ?? function.Name;
                     var hostRoutePrefix = hostManager.Instance.ScriptConfig.HttpRoutePrefix ?? "api/";
                     hostRoutePrefix = string.IsNullOrEmpty(hostRoutePrefix) || hostRoutePrefix.EndsWith("/")
@@ -189,6 +207,14 @@ namespace Azure.Functions.Cli.Actions.HostActions
             }
         }
 
+        /// <summary>
+        /// This method reads the secrets from appsettings.json and sets them
+        /// AppSettings are set in environment variables, ConfigurationManager.AppSettings
+        /// ConnectionStrings are only set in ConfigurationManager.ConnectionStrings
+        /// 
+        /// It also sets up a FileSystemWatcher that kills the current running process
+        /// when appsettings.json is updated.
+        /// </summary>
         private void ReadSecrets()
         {
             try
@@ -218,8 +244,12 @@ namespace Azure.Functions.Cli.Actions.HostActions
             };
             fsWatcher.EnableRaisingEvents = true;
         }
-
-        // https://msdn.microsoft.com/en-us/library/system.configuration.configurationmanager.appsettings(v=vs.110).aspx
+        /// <summary>
+        /// Code is based on:
+        /// https://msdn.microsoft.com/en-us/library/system.configuration.configurationmanager.appsettings(v=vs.110).aspx
+        /// All connection strings are set to have providerName = System.Data.SqlClient
+        /// </summary>
+        /// <param name="connectionStrings">ConnectionStringName => ConnectionStringValue map</param>
         private void UpdateConnectionStrings(IDictionary<string, string> connectionStrings)
         {
             try
@@ -231,10 +261,12 @@ namespace Azure.Functions.Cli.Actions.HostActions
                 {
                     if (settings[pair.Key] == null)
                     {
-                        settings.Add(new ConnectionStringSettings(pair.Key, pair.Value));
+                        settings.Add(new ConnectionStringSettings(pair.Key, pair.Value, Constants.DefaultSqlProviderName));
                     }
                     else
                     {
+                        // No need to update providerName as we always start off with a clean .config
+                        // every time the cli is updated.
                         settings[pair.Key].ConnectionString = pair.Value;
                     }
                 }
@@ -254,16 +286,19 @@ namespace Azure.Functions.Cli.Actions.HostActions
                 Environment.SetEnvironmentVariable(pair.Key, pair.Value, EnvironmentVariableTarget.Process);
             }
         }
-
-        // https://msdn.microsoft.com/en-us/library/system.configuration.configurationmanager.appsettings(v=vs.110).aspx
-        private static void UpdateAppSettings(IDictionary<string, string> secrets)
+        /// <summary>
+        /// Code is based on:
+        /// https://msdn.microsoft.com/en-us/library/system.configuration.configurationmanager.appsettings(v=vs.110).aspx
+        /// </summary>
+        /// <param name="appSettings"></param>
+        private static void UpdateAppSettings(IDictionary<string, string> appSettings)
         {
             try
             {
                 var configFile = ConfigurationManager.OpenExeConfiguration(ConfigurationUserLevel.None);
                 var settings = configFile.AppSettings.Settings;
                 settings.Clear();
-                foreach (var pair in secrets)
+                foreach (var pair in appSettings)
                 {
                     if (settings[pair.Key] == null)
                     {
@@ -309,6 +344,12 @@ namespace Azure.Functions.Cli.Actions.HostActions
             return new Uri($"{protocol}://localhost:{Port}");
         }
 
+        /// <summary>
+        /// Since this is a CLI, we will never really have multiple instances of
+        /// StartHostAction objects and there is no concern for memory leaking
+        /// or not disposing properly of resources since the whole process would
+        /// die eventually.
+        /// </summary>
         [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Usage", "CA2202:Do not dispose objects multiple times")]
         public void Dispose()
         {
